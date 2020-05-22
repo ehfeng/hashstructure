@@ -1,10 +1,10 @@
 package hashstructure
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"hash"
-	"hash/fnv"
 	"reflect"
 )
 
@@ -16,21 +16,6 @@ type ErrNotStringer struct {
 // Error implements error for ErrNotStringer
 func (ens *ErrNotStringer) Error() string {
 	return fmt.Sprintf("hashstructure: %s has hash:\"string\" set, but does not implement fmt.Stringer", ens.Field)
-}
-
-// HashOptions are options that are available for hashing.
-type HashOptions struct {
-	// Hasher is the hash function to use. If this isn't set, it will
-	// default to FNV.
-	Hasher hash.Hash64
-
-	// TagName is the struct tag to look at when hashing the structure.
-	// By default this is "hash".
-	TagName string
-
-	// ZeroNil is flag determining if nil pointer should be treated equal
-	// to a zero value of pointed type. By default this is false.
-	ZeroNil bool
 }
 
 // Hash returns the hash value of an arbitrary value.
@@ -65,34 +50,18 @@ type HashOptions struct {
 //   * "string" - The field will be hashed as a string, only works when the
 //                field implements fmt.Stringer
 //
-func Hash(v interface{}, opts *HashOptions) (uint64, error) {
-	// Create default options
-	if opts == nil {
-		opts = &HashOptions{}
-	}
-	if opts.Hasher == nil {
-		opts.Hasher = fnv.New64()
-	}
-	if opts.TagName == "" {
-		opts.TagName = "hash"
-	}
-
-	// Reset the hash
-	opts.Hasher.Reset()
-
+func Hash(v interface{}) ([]byte, error) {
 	// Create our walker and walk the structure
 	w := &walker{
-		h:       opts.Hasher,
-		tag:     opts.TagName,
-		zeronil: opts.ZeroNil,
+		h:   sha256.New(),
+		tag: "hash",
 	}
 	return w.visit(reflect.ValueOf(v), nil)
 }
 
 type walker struct {
-	h       hash.Hash64
-	tag     string
-	zeronil bool
+	h   hash.Hash
+	tag string
 }
 
 type visitOpts struct {
@@ -104,7 +73,7 @@ type visitOpts struct {
 	StructField string
 }
 
-func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
+func (w *walker) visit(v reflect.Value, opts *visitOpts) ([]byte, error) {
 	t := reflect.TypeOf(0)
 
 	// Loop since these can be wrapped in multiple layers of pointers
@@ -119,9 +88,6 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 		}
 
 		if v.Kind() == reflect.Ptr {
-			if w.zeronil {
-				t = v.Type().Elem()
-			}
 			v = reflect.Indirect(v)
 			continue
 		}
@@ -156,17 +122,17 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 		// A direct hash calculation
 		w.h.Reset()
 		err := binary.Write(w.h, binary.LittleEndian, v.Interface())
-		return w.h.Sum64(), err
+		return w.h.Sum(nil), err
 	}
 
 	switch k {
 	case reflect.Array:
-		var h uint64
+		var h []byte
 		l := v.Len()
 		for i := 0; i < l; i++ {
 			current, err := w.visit(v.Index(i), nil)
 			if err != nil {
-				return 0, err
+				return nil, err
 			}
 
 			h = hashUpdateOrdered(w.h, h, current)
@@ -184,14 +150,14 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 
 		// Build the hash for the map. We do this by XOR-ing all the key
 		// and value hashes. This makes it deterministic despite ordering.
-		var h uint64
+		var h []byte
 		for _, k := range v.MapKeys() {
 			v := v.MapIndex(k)
 			if includeMap != nil {
 				incl, err := includeMap.HashIncludeMap(
 					opts.StructField, k.Interface(), v.Interface())
 				if err != nil {
-					return 0, err
+					return nil, err
 				}
 				if !incl {
 					continue
@@ -200,11 +166,11 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 
 			kh, err := w.visit(k, nil)
 			if err != nil {
-				return 0, err
+				return nil, err
 			}
 			vh, err := w.visit(v, nil)
 			if err != nil {
-				return 0, err
+				return nil, err
 			}
 
 			fieldHash := hashUpdateOrdered(w.h, kh, vh)
@@ -223,7 +189,7 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 		t := v.Type()
 		h, err := w.visit(reflect.ValueOf(t.Name()), nil)
 		if err != nil {
-			return 0, err
+			return nil, err
 		}
 
 		l := v.NumField()
@@ -247,7 +213,7 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 					if impl, ok := innerV.Interface().(fmt.Stringer); ok {
 						innerV = reflect.ValueOf(impl.String())
 					} else {
-						return 0, &ErrNotStringer{
+						return nil, &ErrNotStringer{
 							Field: v.Type().Field(i).Name,
 						}
 					}
@@ -257,7 +223,7 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 				if include != nil {
 					incl, err := include.HashInclude(fieldType.Name, innerV)
 					if err != nil {
-						return 0, err
+						return nil, err
 					}
 					if !incl {
 						continue
@@ -271,7 +237,7 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 
 				kh, err := w.visit(reflect.ValueOf(fieldType.Name), nil)
 				if err != nil {
-					return 0, err
+					return nil, err
 				}
 
 				vh, err := w.visit(innerV, &visitOpts{
@@ -280,7 +246,7 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 					StructField: fieldType.Name,
 				})
 				if err != nil {
-					return 0, err
+					return nil, err
 				}
 
 				fieldHash := hashUpdateOrdered(w.h, kh, vh)
@@ -294,7 +260,7 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 		// We have two behaviors here. If it isn't a set, then we just
 		// visit all the elements. If it is a set, then we do a deterministic
 		// hash code.
-		var h uint64
+		var h []byte
 		var set bool
 		if opts != nil {
 			set = (opts.Flags & visitFlagSet) != 0
@@ -303,7 +269,7 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 		for i := 0; i < l; i++ {
 			current, err := w.visit(v.Index(i), nil)
 			if err != nil {
-				return 0, err
+				return nil, err
 			}
 
 			if set {
@@ -319,15 +285,15 @@ func (w *walker) visit(v reflect.Value, opts *visitOpts) (uint64, error) {
 		// Directly hash
 		w.h.Reset()
 		_, err := w.h.Write([]byte(v.String()))
-		return w.h.Sum64(), err
+		return w.h.Sum(nil), err
 
 	default:
-		return 0, fmt.Errorf("unknown kind to hash: %s", k)
+		return nil, fmt.Errorf("unknown kind to hash: %s", k)
 	}
 
 }
 
-func hashUpdateOrdered(h hash.Hash64, a, b uint64) uint64 {
+func hashUpdateOrdered(h hash.Hash, a, b []byte) []byte {
 	// For ordered updates, use a real hash function
 	h.Reset()
 
@@ -342,11 +308,11 @@ func hashUpdateOrdered(h hash.Hash64, a, b uint64) uint64 {
 		panic(e2)
 	}
 
-	return h.Sum64()
+	return h.Sum(nil)
 }
 
-func hashUpdateUnordered(a, b uint64) uint64 {
-	return a ^ b
+func hashUpdateUnordered(a, b []byte) []byte {
+	return append(a, b...)
 }
 
 // visitFlag is used as a bitmask for affecting visit behavior
